@@ -318,8 +318,9 @@ function buildUpstreamUrl(
   if (viaOpenRouter) {
     // OpenRouter uses the full provider/model format as model ID
     // e.g., "openai/gpt-4o", "anthropic/claude-sonnet-4"
+    const orPath = baseUrl.endsWith("/v1") && path.startsWith("/v1") ? path.slice(3) : path;
     return {
-      url: `${baseUrl}${path}`,
+      url: `${baseUrl}${orPath}`,
       provider,
       apiKey,
       actualModelId: modelId, // Keep full ID for OpenRouter
@@ -329,6 +330,11 @@ function buildUpstreamUrl(
 
   // Direct provider access — strip provider prefix
   const actualModelId = modelId.includes("/") ? modelId.split("/").slice(1).join("/") : modelId;
+
+  // Strip /v1 prefix from path if baseUrl already ends with /v1
+  const normalizedPath = baseUrl.endsWith("/v1") && path.startsWith("/v1")
+    ? path.slice(3) // remove leading /v1
+    : path;
 
   // Google uses a different URL structure
   if (provider === "google") {
@@ -342,7 +348,7 @@ function buildUpstreamUrl(
   }
 
   return {
-    url: `${baseUrl}${path}`,
+    url: `${baseUrl}${normalizedPath}`,
     provider,
     apiKey,
     actualModelId,
@@ -437,6 +443,7 @@ async function tryModelRequest(
   const headers = buildProviderHeaders(upstream.provider, upstream.apiKey, upstream.viaOpenRouter);
 
   try {
+    console.log(`[ClawRouter] → ${upstream.provider} ${upstream.url} model=${upstream.actualModelId} viaOR=${upstream.viaOpenRouter}`);
     const response = await fetch(upstream.url, {
       method,
       headers,
@@ -446,6 +453,7 @@ async function tryModelRequest(
 
     if (response.status !== 200) {
       const errorBody = await response.text();
+      console.log(`[ClawRouter] ← ${response.status} ${errorBody.slice(0, 200)}`);
       return {
         success: false,
         errorBody,
