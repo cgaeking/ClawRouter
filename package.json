@@ -1,0 +1,60 @@
+{
+  "name": "clawrouter",
+  "version": "1.0.0",
+  "description": "Smart LLM router — your API keys, intelligent routing, maximum savings. No crypto required.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "clawrouter": "./dist/cli.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "llm",
+    "router",
+    "smart-routing",
+    "ai",
+    "openclaw",
+    "cost-optimization",
+    "openai",
+    "anthropic",
+    "gemini",
+    "deepseek"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "openclaw": ">=2025.1.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "openclaw": "latest",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "clawrouter",
+  "name": "ClawRouter",
+  "description": "Smart LLM router — your API keys, intelligent routing, maximum savings",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "providers": {
+        "type": "object",
+        "description": "API keys per provider: { \"openai\": { \"apiKey\": \"sk-...\" }, ... }"
+      },
+      "routing": {
+        "type": "object",
+        "description": "Override default routing configuration"
+      }
+    }
+  }
+}
