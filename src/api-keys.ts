@@ -29,6 +29,14 @@ export const PROVIDER_ENDPOINTS: Record<string, string> = {
   openrouter: "https://openrouter.ai/api/v1",
 };
 
+/**
+ * Providers that accept the OpenAI /v1/chat/completions format.
+ * Anthropic and Google use incompatible APIs and must go via OpenRouter.
+ */
+const OPENAI_COMPATIBLE_PROVIDERS = new Set([
+  "openai", "xai", "deepseek", "moonshot", "nvidia",
+]);
+
 /** Environment variable names per provider */
 const ENV_VAR_MAP: Record<string, string> = {
   openai: "OPENAI_API_KEY",
@@ -153,9 +161,10 @@ export function resolveProviderAccess(
   }
 
   // 1. Direct provider key (cheapest, no middleman)
+  //    Only for OpenAI-compatible providers — Anthropic/Google use different APIs
   const directKey = getApiKey(config, provider);
   const directUrl = getProviderBaseUrl(config, provider);
-  if (directKey && directUrl) {
+  if (directKey && directUrl && OPENAI_COMPATIBLE_PROVIDERS.has(provider)) {
     return { apiKey: directKey, baseUrl: directUrl, provider, viaOpenRouter: false };
   }
 

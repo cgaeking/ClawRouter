@@ -60,11 +60,13 @@ export function resolveModelAlias(model: string): string {
   const resolved = MODEL_ALIASES[normalized];
   if (resolved) return resolved;
 
-  // Check with "blockrun/" prefix stripped
-  if (normalized.startsWith("blockrun/")) {
-    const withoutPrefix = normalized.slice("blockrun/".length);
-    const resolvedWithoutPrefix = MODEL_ALIASES[withoutPrefix];
-    if (resolvedWithoutPrefix) return resolvedWithoutPrefix;
+  // Check with "blockrun/" or "clawrouter/" prefix stripped
+  for (const prefix of ["blockrun/", "clawrouter/"]) {
+    if (normalized.startsWith(prefix)) {
+      const withoutPrefix = normalized.slice(prefix.length);
+      const resolvedWithoutPrefix = MODEL_ALIASES[withoutPrefix];
+      if (resolvedWithoutPrefix) return resolvedWithoutPrefix;
+    }
   }
 
   return model;

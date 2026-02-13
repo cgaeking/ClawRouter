@@ -122,7 +122,7 @@ const PROVIDER_ERROR_PATTERNS = [
   /api.*key.*invalid/i, /authentication.*failed/i,
 ];
 
-const FALLBACK_STATUS_CODES = [400, 401, 402, 403, 429, 500, 502, 503, 504];
+const FALLBACK_STATUS_CODES = [400, 401, 402, 403, 404, 405, 429, 500, 502, 503, 504];
 
 function isProviderError(status: number, body: string): boolean {
   if (!FALLBACK_STATUS_CODES.includes(status)) return false;
@@ -955,16 +955,23 @@ async function proxyRequest(
         // SSE can start with "data: ", "event: ", or ": " (comment/heartbeat)
         const isSSE = jsonStr.startsWith("data: ") || jsonStr.startsWith("event: ") || jsonStr.startsWith(": ");
         if (isSSE) {
-          // Already SSE format - filter out OpenRouter processing comments and non-JSON data lines
-          const filteredLines: string[] = [];
-          for (const line of jsonStr.split("\n")) {
-            // Skip OpenRouter "PROCESSING" lines (e.g., "data: : OPENROUTER PROCESSING")
-            if (line.startsWith("data: :") || line.startsWith("data: : ")) continue;
-            filteredLines.push(line);
+          // Already SSE format - filter out non-JSON lines (e.g. OpenRouter processing comments)
+          const cleaned = jsonStr
+            .split("\n")
+            .filter((line) => {
+              const trimmed = line.trim();
+              // Keep empty lines (SSE event separators), data: [DONE], and valid JSON data lines
+              if (trimmed === "") return true;
+              if (trimmed === "data: [DONE]") return true;
+              if (trimmed.startsWith("data: {")) return true;
+              // Drop SSE comments and non-JSON data lines (e.g. ": OPENROUTER PROCESSING")
+              return false;
+            })
+            .join("\n");
+          if (cleaned.trim()) {
+            safeWrite(res, cleaned);
+            responseChunks.push(Buffer.from(cleaned));
           }
-          const filtered = filteredLines.join("\n");
-          safeWrite(res, filtered);
-          responseChunks.push(Buffer.from(filtered));
         } else {
           // JSON response - convert to SSE
           // If from Anthropic, convert to OpenAI format first
