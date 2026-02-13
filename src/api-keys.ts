@@ -143,6 +143,15 @@ export function resolveProviderAccess(
 ): { apiKey: string; baseUrl: string; provider: string; viaOpenRouter: boolean } | undefined {
   const provider = getProviderFromModel(modelId);
 
+  // Anthropic + Google need format conversion (tools, streaming, etc.)
+  // Always route through OpenRouter if available — it handles conversion automatically
+  const needsConversion = provider === "anthropic" || provider === "google";
+  const orKey = config.providers.openrouter?.apiKey;
+  if (needsConversion && orKey) {
+    const orUrl = config.providers.openrouter?.baseUrl ?? PROVIDER_ENDPOINTS.openrouter;
+    return { apiKey: orKey, baseUrl: orUrl, provider: "openrouter", viaOpenRouter: true };
+  }
+
   // 1. Direct provider key (cheapest, no middleman)
   const directKey = getApiKey(config, provider);
   const directUrl = getProviderBaseUrl(config, provider);
@@ -151,10 +160,10 @@ export function resolveProviderAccess(
   }
 
   // 2. OpenRouter fallback (covers all providers)
-  const orKey = config.providers.openrouter?.apiKey;
-  if (orKey) {
-    const orUrl = config.providers.openrouter?.baseUrl ?? PROVIDER_ENDPOINTS.openrouter;
-    return { apiKey: orKey, baseUrl: orUrl, provider: "openrouter", viaOpenRouter: true };
+  const orFallbackKey = config.providers.openrouter?.apiKey;
+  if (orFallbackKey) {
+    const orUrl2 = config.providers.openrouter?.baseUrl ?? PROVIDER_ENDPOINTS.openrouter;
+    return { apiKey: orFallbackKey, baseUrl: orUrl2, provider: "openrouter", viaOpenRouter: true };
   }
 
   return undefined;

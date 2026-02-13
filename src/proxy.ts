@@ -262,6 +262,70 @@ function stripThinkingTokens(content: string): string {
   return cleaned;
 }
 
+/**
+ * Convert OpenAI chat completion format to Anthropic Messages API format.
+ */
+function convertToAnthropicFormat(parsed: Record<string, unknown>): Record<string, unknown> {
+  const messages = (parsed.messages as ChatMessage[]) || [];
+  
+  // Extract system message
+  let system: string | undefined;
+  const nonSystemMessages: Array<{ role: string; content: string | unknown }> = [];
+  
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      system = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+    } else {
+      nonSystemMessages.push({
+        role: msg.role === "assistant" ? "assistant" : "user",
+        content: msg.content,
+      });
+    }
+  }
+
+  const result: Record<string, unknown> = {
+    model: parsed.model,
+    messages: nonSystemMessages,
+    max_tokens: (parsed.max_tokens as number) || 4096,
+  };
+
+  if (system) result.system = system;
+  if (parsed.stream) result.stream = true;
+  if (parsed.temperature !== undefined) result.temperature = parsed.temperature;
+  if (parsed.top_p !== undefined) result.top_p = parsed.top_p;
+  if (parsed.tools) result.tools = parsed.tools;
+
+  return result;
+}
+
+/**
+ * Convert Anthropic response to OpenAI format.
+ */
+function convertAnthropicResponseToOpenAI(anthropicData: Record<string, unknown>): Record<string, unknown> {
+  const content = anthropicData.content as Array<{ type: string; text?: string }> | undefined;
+  const textContent = content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+  
+  return {
+    id: (anthropicData.id as string) || `chatcmpl-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: anthropicData.model,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: textContent,
+      },
+      finish_reason: anthropicData.stop_reason === "end_turn" ? "stop" : (anthropicData.stop_reason || "stop"),
+    }],
+    usage: anthropicData.usage ? {
+      prompt_tokens: (anthropicData.usage as Record<string, number>).input_tokens || 0,
+      completion_tokens: (anthropicData.usage as Record<string, number>).output_tokens || 0,
+      total_tokens: ((anthropicData.usage as Record<string, number>).input_tokens || 0) + ((anthropicData.usage as Record<string, number>).output_tokens || 0),
+    } : undefined,
+  };
+}
+
 export type ProxyOptions = {
   apiKeys: ApiKeysConfig;
   port?: number;
@@ -343,6 +407,25 @@ function buildUpstreamUrl(
       provider,
       apiKey,
       actualModelId,
+      viaOpenRouter: false,
+    };
+  }
+
+  // Anthropic uses /v1/messages, not /v1/chat/completions
+  // Also needs full model IDs (e.g., claude-sonnet-4-20250514)
+  if (provider === "anthropic") {
+    const ANTHROPIC_MODEL_MAP: Record<string, string> = {
+      "claude-sonnet-4": "claude-sonnet-4-20250514",
+      "claude-opus-4": "claude-opus-4-20250514",
+      "claude-opus-4.5": "claude-opus-4-20250514", // fallback
+      "claude-haiku-4.5": "claude-haiku-4-20250414",
+    };
+    const mappedModel = ANTHROPIC_MODEL_MAP[actualModelId] || actualModelId;
+    return {
+      url: `${baseUrl}/messages`,
+      provider,
+      apiKey,
+      actualModelId: mappedModel,
       viaOpenRouter: false,
     };
   }
@@ -435,7 +518,13 @@ async function tryModelRequest(
       parsed.messages = normalizeMessagesForThinking(parsed.messages as ExtendedChatMessage[]);
     }
 
-    requestBody = Buffer.from(JSON.stringify(parsed));
+    // Convert OpenAI format to Anthropic Messages API format
+    if (upstream.provider === "anthropic" && !upstream.viaOpenRouter) {
+      const anthropicBody = convertToAnthropicFormat(parsed);
+      requestBody = Buffer.from(JSON.stringify(anthropicBody));
+    } else {
+      requestBody = Buffer.from(JSON.stringify(parsed));
+    }
   } catch {
     // If body isn't valid JSON, use as-is
   }
@@ -863,14 +952,33 @@ async function proxyRequest(
         const jsonStr = jsonBody.toString();
 
         // Check if response is SSE (streaming) or JSON (non-streaming)
-        if (jsonStr.startsWith("data: ")) {
-          // Already SSE format - forward as-is
-          safeWrite(res, jsonStr);
-          responseChunks.push(Buffer.from(jsonStr));
+        // SSE can start with "data: ", "event: ", or ": " (comment/heartbeat)
+        const isSSE = jsonStr.startsWith("data: ") || jsonStr.startsWith("event: ") || jsonStr.startsWith(": ");
+        if (isSSE) {
+          // Already SSE format - filter out OpenRouter processing comments and non-JSON data lines
+          const filteredLines: string[] = [];
+          for (const line of jsonStr.split("\n")) {
+            // Skip OpenRouter "PROCESSING" lines (e.g., "data: : OPENROUTER PROCESSING")
+            if (line.startsWith("data: :") || line.startsWith("data: : ")) continue;
+            filteredLines.push(line);
+          }
+          const filtered = filteredLines.join("\n");
+          safeWrite(res, filtered);
+          responseChunks.push(Buffer.from(filtered));
         } else {
           // JSON response - convert to SSE
+          // If from Anthropic, convert to OpenAI format first
+          let responseJson = jsonStr;
           try {
-            const rsp = JSON.parse(jsonStr) as {
+            const rawParsed = JSON.parse(jsonStr);
+            if (rawParsed.type === "message" && rawParsed.content) {
+              // This is an Anthropic response — convert to OpenAI format
+              const converted = convertAnthropicResponseToOpenAI(rawParsed);
+              responseJson = JSON.stringify(converted);
+            }
+          } catch { /* not JSON or parse error, continue */ }
+          try {
+            const rsp = JSON.parse(responseJson) as {
               id?: string; created?: number; model?: string;
               choices?: Array<{ index?: number; message?: { role?: string; content?: string; tool_calls?: unknown[] }; delta?: { role?: string; content?: string; tool_calls?: unknown[] }; finish_reason?: string | null }>;
             };
@@ -932,23 +1040,34 @@ async function proxyRequest(
         responseHeaders[key] = value;
       });
 
-      res.writeHead(upstream.status, responseHeaders);
       if (upstream.body) {
         const reader = upstream.body.getReader();
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = Buffer.from(value);
-            safeWrite(res, chunk);
-            responseChunks.push(chunk);
+            responseChunks.push(Buffer.from(value));
           }
         } finally {
           reader.releaseLock();
         }
       }
+      let finalBody = Buffer.concat(responseChunks);
+      
+      // Convert Anthropic response to OpenAI format for non-streaming
+      try {
+        const rawParsed = JSON.parse(finalBody.toString());
+        if (rawParsed.type === "message" && rawParsed.content) {
+          const converted = convertAnthropicResponseToOpenAI(rawParsed);
+          finalBody = Buffer.from(JSON.stringify(converted));
+          responseHeaders["content-type"] = "application/json";
+        }
+      } catch { /* not JSON, pass through */ }
+      
+      res.writeHead(upstream.status, responseHeaders);
+      safeWrite(res, finalBody);
       res.end();
-      deduplicator.complete(dedupKey, { status: upstream.status, headers: responseHeaders, body: Buffer.concat(responseChunks), completedAt: Date.now() });
+      deduplicator.complete(dedupKey, { status: upstream.status, headers: responseHeaders, body: finalBody, completedAt: Date.now() });
     }
 
     completed = true;
