@@ -42,6 +42,7 @@ import { getStats } from "./stats.js";
 import { RequestDeduplicator } from "./dedup.js";
 import { USER_AGENT } from "./version.js";
 import { SessionStore, getSessionId, type SessionConfig } from "./session.js";
+import { resolveOpenRouterModelId, ensureOpenRouterCache } from "./openrouter-models.js";
 
 const AUTO_MODEL = "clawrouter/auto";
 const AUTO_MODEL_SHORT = "auto";
@@ -380,14 +381,17 @@ function buildUpstreamUrl(
   const { apiKey, baseUrl, provider, viaOpenRouter } = access;
 
   if (viaOpenRouter) {
-    // OpenRouter uses the full provider/model format as model ID
-    // e.g., "openai/gpt-4o", "anthropic/claude-sonnet-4"
+    // Resolve ClawRouter model ID to OpenRouter's model ID
+    // e.g., "moonshot/kimi-k2.5" → "moonshotai/kimi-k2.5"
+    const resolvedModelId = resolveOpenRouterModelId(modelId);
+    // Trigger background cache refresh if stale
+    ensureOpenRouterCache(apiKey);
     const orPath = baseUrl.endsWith("/v1") && path.startsWith("/v1") ? path.slice(3) : path;
     return {
       url: `${baseUrl}${orPath}`,
       provider,
       apiKey,
-      actualModelId: modelId, // Keep full ID for OpenRouter
+      actualModelId: resolvedModelId,
       viaOpenRouter: true,
     };
   }

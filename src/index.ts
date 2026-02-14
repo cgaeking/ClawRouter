@@ -26,6 +26,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { VERSION } from "./version.js";
 import { getStats, formatStatsAscii } from "./stats.js";
+import { refreshOpenRouterModels } from "./openrouter-models.js";
 
 async function waitForProxyHealth(port: number, timeoutMs = 3000): Promise<boolean> {
   const start = Date.now();
@@ -155,6 +156,14 @@ async function startProxyInBackground(api: OpenClawPluginApi, apiKeys: ApiKeysCo
   setActiveProxy(proxy);
   activeProxyHandle = proxy;
   api.logger.info(`ClawRouter ready — ${accessibleProviders.length} providers accessible, smart routing enabled`);
+
+  // Pre-load OpenRouter model catalog for ID resolution
+  if (hasOpenRouter(apiKeys)) {
+    const orKey = apiKeys.providers.openrouter.apiKey;
+    refreshOpenRouterModels(orKey).catch((err) =>
+      api.logger.warn(`Failed to load OpenRouter models: ${err.message}`),
+    );
+  }
 }
 
 async function createStatsCommand(): Promise<OpenClawPluginCommandDefinition> {
@@ -328,3 +337,4 @@ export { SessionStore, getSessionId, DEFAULT_SESSION_CONFIG } from "./session.js
 export type { SessionEntry, SessionConfig } from "./session.js";
 export { loadApiKeys, getConfiguredProviders, getApiKey, getProviderFromModel, resolveProviderAccess, hasOpenRouter, getAccessibleProviders, isModelAccessible } from "./api-keys.js";
 export type { ApiKeysConfig, ProviderConfig } from "./api-keys.js";
+export { refreshOpenRouterModels, resolveOpenRouterModelId, isOpenRouterCacheReady } from "./openrouter-models.js";
