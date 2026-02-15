@@ -647,12 +647,12 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       ],
     },
     COMPLEX: {
-      primary: "anthropic/claude-sonnet-4",
-      fallback: ["anthropic/claude-opus-4", "google/gemini-2.5-pro", "xai/grok-4-0709", "openai/gpt-4o"],
+      primary: "google/gemini-2.5-pro",
+      fallback: ["anthropic/claude-sonnet-4", "xai/grok-4-0709", "openai/gpt-4o"],
     },
     REASONING: {
-      primary: "anthropic/claude-opus-4",
-      fallback: ["anthropic/claude-sonnet-4", "xai/grok-4-fast-reasoning", "deepseek/deepseek-reasoner", "google/gemini-2.5-pro"],
+      primary: "xai/grok-4-fast-reasoning", // Ultra-cheap reasoning $0.20/$0.50
+      fallback: ["deepseek/deepseek-reasoner", "moonshot/kimi-k2.5", "google/gemini-2.5-pro"],
     },
   },
 
@@ -660,19 +660,19 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
   agenticTiers: {
     SIMPLE: {
       primary: "anthropic/claude-haiku-4.5",
-      fallback: ["moonshotai/kimi-k2.5", "xai/grok-4-fast-non-reasoning", "openai/gpt-4o-mini"],
+      fallback: ["moonshot/kimi-k2.5", "xai/grok-4-fast-non-reasoning", "openai/gpt-4o-mini"],
     },
     MEDIUM: {
       primary: "xai/grok-code-fast-1", // Code specialist for agentic coding
-      fallback: ["moonshotai/kimi-k2.5", "anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4"],
+      fallback: ["moonshot/kimi-k2.5", "anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4"],
     },
     COMPLEX: {
-      primary: "anthropic/claude-opus-4",
+      primary: "google/gemini-2.5-pro", // 1M context, strong tool use, ~60% cheaper than Sonnet
       fallback: ["anthropic/claude-sonnet-4", "xai/grok-4-0709", "openai/gpt-4o"],
     },
     REASONING: {
-      primary: "anthropic/claude-opus-4",
-      fallback: ["anthropic/claude-sonnet-4", "xai/grok-4-fast-reasoning", "deepseek/deepseek-reasoner"],
+      primary: "anthropic/claude-sonnet-4", // Strong tool use + reasoning for agentic tasks
+      fallback: ["xai/grok-4-fast-reasoning", "moonshot/kimi-k2.5", "deepseek/deepseek-reasoner"],
     },
   },
 

@@ -35,9 +35,13 @@ export function route(
   // Estimate input tokens (~4 chars per token)
   const fullText = `${systemPrompt ?? ""} ${prompt}`;
   const estimatedTokens = Math.ceil(fullText.length / 4);
+  // User-only tokens — system prompt (tool defs, instructions) doesn't make
+  // the task more complex and shouldn't inflate scoring or force overrides
+  const estimatedUserTokens = Math.ceil(prompt.length / 4);
 
   // --- Rule-based classification (runs first to get agenticScore) ---
-  const ruleResult = classifyByRules(prompt, systemPrompt, estimatedTokens, config.scoring);
+  // Pass user-only tokens so scoreTokenCount reflects actual request complexity
+  const ruleResult = classifyByRules(prompt, systemPrompt, estimatedUserTokens, config.scoring);
 
   // Determine if agentic tiers should be used:
   // 1. Explicit agenticMode config OR
@@ -49,7 +53,8 @@ export function route(
   const tierConfigs = useAgenticTiers ? config.agenticTiers! : config.tiers;
 
   // --- Override: large context → force COMPLEX ---
-  if (estimatedTokens > config.overrides.maxTokensForceComplex) {
+  // Uses user-only tokens — system prompt tool definitions shouldn't force COMPLEX
+  if (estimatedUserTokens > config.overrides.maxTokensForceComplex) {
     return selectModel(
       "COMPLEX",
       0.95,

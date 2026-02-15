@@ -789,8 +789,21 @@ async function proxyRequest(
           modelId = existingSession.model;
           sessionStore.touchSession(sessionId!);
         } else {
-          type Msg = { role: string; content: string };
+          type ContentPart = { type: string; text?: string };
+          type Msg = { role: string; content: string | ContentPart[] | null };
           const messages = parsed.messages as Msg[] | undefined;
+
+          function extractText(content: string | ContentPart[] | null | undefined): string {
+            if (typeof content === "string") return content;
+            if (Array.isArray(content)) {
+              return content
+                .filter((p): p is ContentPart & { text: string } => p.type === "text" && typeof p.text === "string")
+                .map((p) => p.text)
+                .join("\n");
+            }
+            return "";
+          }
+
           let lastUserMsg: Msg | undefined;
           if (messages) {
             for (let i = messages.length - 1; i >= 0; i--) {
@@ -798,8 +811,8 @@ async function proxyRequest(
             }
           }
           const systemMsg = messages?.find((m: Msg) => m.role === "system");
-          const prompt = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
-          const systemPrompt = typeof systemMsg?.content === "string" ? systemMsg.content : undefined;
+          const prompt = extractText(lastUserMsg?.content);
+          const systemPrompt = extractText(systemMsg?.content) || undefined;
 
           routingDecision = route(prompt, systemPrompt, maxTokens, routerOpts);
 
@@ -1100,6 +1113,7 @@ async function proxyRequest(
       baselineCost: routingDecision.baselineCost,
       savings: routingDecision.savings,
       latencyMs: Date.now() - startTime,
+      reasoning: routingDecision.reasoning,
     };
     logUsage(entry).catch(() => {});
   }

@@ -20,6 +20,7 @@ export type UsageEntry = {
   baselineCost: number;
   savings: number; // 0-1 percentage
   latencyMs: number;
+  reasoning?: string; // Router classification reasoning (for debugging)
 };
 
 const LOG_DIR = join(homedir(), ".openclaw", "clawrouter", "logs");
