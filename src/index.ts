@@ -240,7 +240,7 @@ const plugin: OpenClawPluginDefinition = {
   description: "Smart LLM router — your keys, smart routing, maximum savings",
   version: VERSION,
 
-  async register(api: OpenClawPluginApi) {
+  register(api: OpenClawPluginApi) {
     const isDisabled = process.env.CLAWROUTER_DISABLED === "true" || process.env.CLAWROUTER_DISABLED === "1";
     if (isDisabled) {
       api.logger.info("ClawRouter disabled (CLAWROUTER_DISABLED=true)");
