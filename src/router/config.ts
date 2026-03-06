@@ -643,8 +643,8 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
     },
     COMPLEX: {
-      primary: "amazon-bedrock/eu.anthropic.claude-sonnet-4-6",
-      fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
+      primary: "amazon-bedrock/eu.anthropic.claude-opus-4-6-v1",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-sonnet-4-6", "openai/gpt-4o"],
     },
     REASONING: {
       primary: "amazon-bedrock/eu.anthropic.claude-opus-4-6-v1",
@@ -663,8 +663,8 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
     },
     COMPLEX: {
-      primary: "amazon-bedrock/eu.anthropic.claude-sonnet-4-6",
-      fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
+      primary: "amazon-bedrock/eu.anthropic.claude-opus-4-6-v1",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-sonnet-4-6", "openai/gpt-4o"],
     },
     REASONING: {
       primary: "amazon-bedrock/eu.anthropic.claude-opus-4-6-v1",

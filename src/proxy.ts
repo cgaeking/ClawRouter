@@ -62,6 +62,21 @@ const PORT_RETRY_DELAY_MS = 1_000;
 const rateLimitedModels = new Map<string, number>();
 
 // ---------------------------------------------------------------------------
+// Stop reason mapping — Anthropic/Bedrock → OpenAI format
+// ---------------------------------------------------------------------------
+function mapStopReason(reason: string | undefined | null): string {
+  switch (reason) {
+    case "end_turn": return "stop";
+    case "max_tokens": return "length";
+    case "tool_use": return "tool_calls";
+    case "stop_sequence": return "stop";
+    default: return reason || "stop";
+  }
+}
+
+import { clog, cerr } from "./log.js";
+
+// ---------------------------------------------------------------------------
 // DisabledModels — in-memory toggle state, persisted to disk
 // ---------------------------------------------------------------------------
 const DISABLED_MODELS_DIR = join(homedir(), ".openclaw", "clawrouter");
@@ -85,7 +100,7 @@ function saveDisabledModels(): void {
     mkdirSync(DISABLED_MODELS_DIR, { recursive: true });
     writeFileSync(DISABLED_MODELS_FILE, JSON.stringify([...disabledModels], null, 2), "utf8");
   } catch (err) {
-    console.error("[ClawRouter] Failed to save disabled-models.json:", err);
+    cerr("[ClawRouter] Failed to save disabled-models.json:", err);
   }
 }
 
@@ -156,7 +171,7 @@ function isRateLimited(modelId: string): boolean {
 
 function markRateLimited(modelId: string): void {
   rateLimitedModels.set(modelId, Date.now());
-  console.log(`[ClawRouter] Model ${modelId} rate-limited, will deprioritize for 60s`);
+  clog(`[ClawRouter] Model ${modelId} rate-limited, will deprioritize for 60s`);
 }
 
 function prioritizeNonRateLimited(models: string[]): string[] {
@@ -404,7 +419,7 @@ function convertAnthropicResponseToOpenAI(anthropicData: Record<string, unknown>
         role: "assistant",
         content: textContent,
       },
-      finish_reason: anthropicData.stop_reason === "end_turn" ? "stop" : (anthropicData.stop_reason || "stop"),
+      finish_reason: mapStopReason(anthropicData.stop_reason as string),
     }],
     usage: anthropicData.usage ? {
       prompt_tokens: (anthropicData.usage as Record<string, number>).input_tokens || 0,
@@ -646,7 +661,7 @@ async function tryBedrockRequest(
         inferenceConfig: inferenceConfig as any,
       });
 
-      console.log(`[ClawRouter] → bedrock ${bedrockModelId} (streaming)`);
+      clog(`[ClawRouter] → bedrock ${bedrockModelId} (streaming)`);
       const response = await client.send(command, { abortSignal: signal });
 
       const stream = response.stream;
@@ -679,7 +694,7 @@ async function tryBedrockRequest(
         }
 
         if (event.messageStop) {
-          const reason = event.messageStop.stopReason === "end_turn" ? "stop" : (event.messageStop.stopReason || "stop");
+          const reason = mapStopReason(event.messageStop.stopReason);
           sseChunks.push(`data: ${JSON.stringify({
             id: chatId, object: "chat.completion.chunk", created, model: modelId,
             choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: reason }],
@@ -706,7 +721,7 @@ async function tryBedrockRequest(
         inferenceConfig: inferenceConfig as any,
       });
 
-      console.log(`[ClawRouter] → bedrock ${bedrockModelId} (non-streaming)`);
+      clog(`[ClawRouter] → bedrock ${bedrockModelId} (non-streaming)`);
       const response = await client.send(command, { abortSignal: signal });
 
       const textContent = response.output?.message?.content
@@ -722,7 +737,7 @@ async function tryBedrockRequest(
         choices: [{
           index: 0,
           message: { role: "assistant", content: textContent },
-          finish_reason: response.stopReason === "end_turn" ? "stop" : (response.stopReason || "stop"),
+          finish_reason: mapStopReason(response.stopReason),
         }],
         usage: response.usage ? {
           prompt_tokens: response.usage.inputTokens || 0,
@@ -744,7 +759,7 @@ async function tryBedrockRequest(
     const status = error.$metadata?.httpStatusCode || 500;
     const isThrottling = error.name === "ThrottlingException" || status === 429;
 
-    console.log(`[ClawRouter] ← bedrock error: ${error.name || "Unknown"} ${error.message?.slice(0, 200)}`);
+    clog(`[ClawRouter] ← bedrock error: ${error.name || "Unknown"} ${error.message?.slice(0, 200)}`);
 
     return {
       success: false,
@@ -818,7 +833,7 @@ async function tryModelRequest(
   const headers = buildProviderHeaders(upstream.provider, upstream.apiKey, upstream.viaOpenRouter);
 
   try {
-    console.log(`[ClawRouter] → ${upstream.provider} ${upstream.url} model=${upstream.actualModelId} viaOR=${upstream.viaOpenRouter}`);
+    clog(`[ClawRouter] → ${upstream.provider} ${upstream.url} model=${upstream.actualModelId} viaOR=${upstream.viaOpenRouter}`);
     const response = await fetch(upstream.url, {
       method,
       headers,
@@ -828,7 +843,7 @@ async function tryModelRequest(
 
     if (response.status !== 200) {
       const errorBody = await response.text();
-      console.log(`[ClawRouter] ← ${response.status} ${errorBody.slice(0, 200)}`);
+      clog(`[ClawRouter] ← ${response.status} ${errorBody.slice(0, 200)}`);
       return {
         success: false,
         errorBody,
@@ -1030,9 +1045,9 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const connections = new Set<import("net").Socket>();
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    req.on("error", (err) => console.error(`[ClawRouter] Request stream error: ${err.message}`));
-    res.on("error", (err) => console.error(`[ClawRouter] Response stream error: ${err.message}`));
-    finished(res, (err) => { if (err && err.code !== "ERR_STREAM_DESTROYED") console.error(`[ClawRouter] Response finished with error: ${err.message}`); });
+    req.on("error", (err) => cerr(`[ClawRouter] Request stream error: ${err.message}`));
+    res.on("error", (err) => cerr(`[ClawRouter] Response stream error: ${err.message}`));
+    finished(res, (err) => { if (err && err.code !== "ERR_STREAM_DESTROYED") cerr(`[ClawRouter] Response finished with error: ${err.message}`); });
 
     // Health check
     if (req.url === "/health" || req.url?.startsWith("/health?")) {
@@ -1186,13 +1201,13 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const port = addr.port;
   options.onReady?.(port);
 
-  server.on("error", (err) => { console.error(`[ClawRouter] Server runtime error: ${err.message}`); options.onError?.(err); });
-  server.on("clientError", (err, socket) => { console.error(`[ClawRouter] Client error: ${err.message}`); if (socket.writable && !socket.destroyed) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); });
+  server.on("error", (err) => { cerr(`[ClawRouter] Server runtime error: ${err.message}`); options.onError?.(err); });
+  server.on("clientError", (err, socket) => { cerr(`[ClawRouter] Client error: ${err.message}`); if (socket.writable && !socket.destroyed) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); });
   server.on("connection", (socket) => {
     connections.add(socket);
     socket.setTimeout(300_000);
     socket.on("timeout", () => socket.destroy());
-    socket.on("error", (err) => console.error(`[ClawRouter] Socket error: ${err.message}`));
+    socket.on("error", (err) => cerr(`[ClawRouter] Socket error: ${err.message}`));
     socket.on("close", () => connections.delete(socket));
   });
 
@@ -1250,7 +1265,7 @@ async function proxyRequest(
         normalizedModel === "blockrun/auto" || // backward compat
         normalizedModel === "clawrouter/auto";
 
-      console.log(`[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}, isAuto: ${isAutoModel}`);
+      clog(`[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}, isAuto: ${isAutoModel}`);
 
       if (wasAlias && !isAutoModel) {
         parsed.model = resolvedModel;
@@ -1262,7 +1277,7 @@ async function proxyRequest(
         const existingSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
 
         if (existingSession) {
-          console.log(`[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`);
+          clog(`[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`);
           parsed.model = existingSession.model;
           modelId = existingSession.model;
           sessionStore.touchSession(sessionId!);
@@ -1318,7 +1333,7 @@ async function proxyRequest(
       body = Buffer.from(JSON.stringify(parsed));
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[ClawRouter] Routing error: ${errorMsg}`);
+      cerr(`[ClawRouter] Routing error: ${errorMsg}`);
       options.onError?.(new Error(`Routing failed: ${errorMsg}`));
     }
   }
@@ -1385,21 +1400,21 @@ async function proxyRequest(
     for (let i = 0; i < modelsToTry.length; i++) {
       const tryModel = modelsToTry[i];
       const isLastAttempt = i === modelsToTry.length - 1;
-      console.log(`[ClawRouter] Trying model ${i + 1}/${modelsToTry.length}: ${tryModel}`);
+      clog(`[ClawRouter] Trying model ${i + 1}/${modelsToTry.length}: ${tryModel}`);
 
       const result = await tryModelRequest(tryModel, requestPath, req.method ?? "POST", body, maxTokens, options.apiKeys, controller.signal);
 
       if (result.success && result.response) {
         upstream = result.response;
         actualModelUsed = tryModel;
-        console.log(`[ClawRouter] Success with model: ${tryModel}`);
+        clog(`[ClawRouter] Success with model: ${tryModel}`);
         break;
       }
 
       lastError = { body: result.errorBody || "Unknown error", status: result.errorStatus || 500 };
       if (result.isProviderError && !isLastAttempt) {
         if (result.errorStatus === 429) markRateLimited(tryModel);
-        console.log(`[ClawRouter] Provider error from ${tryModel}, trying fallback: ${result.errorBody?.slice(0, 100)}`);
+        clog(`[ClawRouter] Provider error from ${tryModel}, trying fallback: ${result.errorBody?.slice(0, 100)}`);
         continue;
       }
       break;
