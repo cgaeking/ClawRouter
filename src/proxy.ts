@@ -14,6 +14,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { finished } from "node:stream";
 import type { AddressInfo } from "node:net";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   loadApiKeys,
   getConfiguredProviders,
@@ -56,6 +59,89 @@ const PORT_RETRY_ATTEMPTS = 5;
 const PORT_RETRY_DELAY_MS = 1_000;
 
 const rateLimitedModels = new Map<string, number>();
+
+// ---------------------------------------------------------------------------
+// DisabledModels — in-memory toggle state, persisted to disk
+// ---------------------------------------------------------------------------
+const DISABLED_MODELS_DIR = join(homedir(), ".openclaw", "clawrouter");
+const DISABLED_MODELS_FILE = join(DISABLED_MODELS_DIR, "disabled-models.json");
+
+const disabledModels = (() => {
+  const s = new Set<string>();
+  try {
+    mkdirSync(DISABLED_MODELS_DIR, { recursive: true });
+    const raw = readFileSync(DISABLED_MODELS_FILE, "utf8");
+    const list = JSON.parse(raw) as string[];
+    if (Array.isArray(list)) list.forEach((id) => s.add(id));
+  } catch {
+    // File doesn't exist yet — start with empty set
+  }
+  return s;
+})();
+
+function saveDisabledModels(): void {
+  try {
+    mkdirSync(DISABLED_MODELS_DIR, { recursive: true });
+    writeFileSync(DISABLED_MODELS_FILE, JSON.stringify([...disabledModels], null, 2), "utf8");
+  } catch (err) {
+    console.error("[ClawRouter] Failed to save disabled-models.json:", err);
+  }
+}
+
+export function isDisabled(modelId: string): boolean {
+  return disabledModels.has(modelId);
+}
+
+export function toggleModel(modelId: string): boolean {
+  if (disabledModels.has(modelId)) {
+    disabledModels.delete(modelId);
+  } else {
+    disabledModels.add(modelId);
+  }
+  saveDisabledModels();
+  return !disabledModels.has(modelId); // returns new enabled state
+}
+
+export function getDisabledSet(): ReadonlySet<string> {
+  return disabledModels;
+}
+
+type ModelInfo = {
+  id: string;
+  provider: string;
+  enabled: boolean;
+  tiers: Array<{ name: string; role: "primary" | "fallback" }>;
+};
+
+export function getAllModelsWithState(config: typeof DEFAULT_ROUTING_CONFIG): ModelInfo[] {
+  const modelMap = new Map<string, ModelInfo>();
+
+  function addModel(id: string, tierName: string, role: "primary" | "fallback"): void {
+    if (!modelMap.has(id)) {
+      const provider = id.includes("/") ? id.split("/")[0] : "unknown";
+      modelMap.set(id, { id, provider, enabled: !disabledModels.has(id), tiers: [] });
+    }
+    modelMap.get(id)!.tiers.push({ name: tierName, role });
+  }
+
+  const tierNames = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"] as const;
+  for (const t of tierNames) {
+    const tier = config.tiers[t];
+    addModel(tier.primary, t, "primary");
+    tier.fallback.forEach((m) => addModel(m, t, "fallback"));
+  }
+  if (config.agenticTiers) {
+    for (const t of tierNames) {
+      const tier = config.agenticTiers[t];
+      if (!tier) continue;
+      addModel(tier.primary, `agentic-${t}`, "primary");
+      tier.fallback.forEach((m) => addModel(m, `agentic-${t}`, "fallback"));
+    }
+  }
+
+  return [...modelMap.values()].sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+}
+// ---------------------------------------------------------------------------
 
 function isRateLimited(modelId: string): boolean {
   const hitTime = rateLimitedModels.get(modelId);
@@ -566,6 +652,164 @@ async function tryModelRequest(
   }
 }
 
+function getDashboardHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ClawRouter — Model Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;font-size:14px;min-height:100vh}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:16px 24px;display:flex;align-items:center;gap:12px}
+header h1{font-size:18px;font-weight:600;color:#e6edf3}
+header .subtitle{color:#8b949e;font-size:13px}
+.badge-live{background:#1a3a1a;color:#3fb950;border:1px solid #238636;border-radius:12px;padding:2px 8px;font-size:11px;margin-left:auto}
+main{max-width:960px;margin:0 auto;padding:24px}
+.warning{background:#2d1c02;border:1px solid #bb8009;border-radius:6px;padding:12px 16px;margin-bottom:20px;color:#d29922;font-size:13px;display:none}
+.warning.show{display:block}
+.provider-group{margin-bottom:28px}
+.provider-title{font-size:12px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #21262d}
+.model-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px;transition:border-color .15s}
+.model-card:hover{border-color:#58a6ff}
+.model-card.disabled{opacity:.55}
+.model-id{flex:1;font-family:monospace;font-size:13px;color:#e6edf3}
+.tiers{display:flex;flex-wrap:wrap;gap:4px;margin-right:8px}
+.tier-badge{border-radius:4px;padding:2px 7px;font-size:11px;font-weight:500;white-space:nowrap}
+.tier-badge.primary{background:#0d2a4a;color:#58a6ff;border:1px solid #1f6feb}
+.tier-badge.fallback{background:#1c1c1c;color:#8b949e;border:1px solid #30363d}
+.toggle{position:relative;width:40px;height:22px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.slider{position:absolute;inset:0;background:#30363d;border-radius:22px;cursor:pointer;transition:.2s}
+.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;background:#8b949e;border-radius:50%;transition:.2s}
+input:checked+.slider{background:#238636}
+input:checked+.slider:before{transform:translateX(18px);background:#fff}
+.toggle:hover .slider{border:1px solid #8b949e}
+.status-bar{text-align:center;color:#484f58;font-size:12px;padding:8px 0 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>ClawRouter</h1>
+  <span class="subtitle">Model Dashboard</span>
+  <span class="badge-live" id="liveTag">live</span>
+</header>
+<main>
+  <div class="warning" id="warning"></div>
+  <div id="groups"></div>
+  <div class="status-bar" id="statusBar">Loading…</div>
+</main>
+<script>
+(function(){
+  let models=[], refreshTimer;
+
+  function tierLabel(name){ return name.replace('agentic-','A-'); }
+
+  function buildTierCoverage(models){
+    const tiers={};
+    for(const m of models){
+      for(const t of m.tiers){
+        if(!tiers[t.name]) tiers[t.name]=[];
+        if(m.enabled) tiers[t.name].push(m.id);
+      }
+    }
+    return tiers;
+  }
+
+  function checkWarning(models){
+    const coverage=buildTierCoverage(models);
+    const empty=Object.entries(coverage).filter(([,ids])=>ids.length===0).map(([t])=>t);
+    const w=document.getElementById('warning');
+    if(empty.length){
+      w.textContent='Warning: '+empty.join(', ')+' '+(empty.length>1?'have':'has')+' no enabled models — requests to those tiers will return 503.';
+      w.classList.add('show');
+    } else {
+      w.classList.remove('show');
+    }
+  }
+
+  function render(data){
+    models=data;
+    checkWarning(models);
+    const byProvider={};
+    for(const m of models){
+      if(!byProvider[m.provider]) byProvider[m.provider]=[];
+      byProvider[m.provider].push(m);
+    }
+    const g=document.getElementById('groups');
+    g.innerHTML='';
+    for(const [provider, list] of Object.entries(byProvider).sort()){
+      const div=document.createElement('div');
+      div.className='provider-group';
+      div.innerHTML='<div class="provider-title">'+escHtml(provider)+'</div>';
+      for(const m of list){
+        const card=document.createElement('div');
+        card.className='model-card'+(m.enabled?'':' disabled');
+        card.dataset.id=m.id;
+        const tBadges=m.tiers.map(t=>'<span class="tier-badge '+escHtml(t.role)+'">'+escHtml(tierLabel(t.name))+'</span>').join('');
+        card.innerHTML=
+          '<span class="model-id">'+escHtml(m.id.includes('/')?m.id.split('/').slice(1).join('/'):m.id)+'</span>'+
+          '<div class="tiers">'+tBadges+'</div>'+
+          '<label class="toggle" title="'+(m.enabled?'Disable':'Enable')+' '+escHtml(m.id)+'">'+
+            '<input type="checkbox"'+(m.enabled?' checked':'')+'data-model="'+escHtml(m.id)+'">'+
+            '<span class="slider"></span>'+
+          '</label>';
+        div.appendChild(card);
+      }
+      g.appendChild(div);
+    }
+    g.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+      cb.addEventListener('change',onToggle);
+    });
+    const ts=new Date().toLocaleTimeString();
+    document.getElementById('statusBar').textContent='Last updated: '+ts+' · '+models.length+' models';
+  }
+
+  function escHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]||c)); }
+
+  async function load(){
+    try{
+      const r=await fetch('/api/models');
+      if(!r.ok) throw new Error(r.status);
+      render(await r.json());
+    }catch(e){
+      document.getElementById('statusBar').textContent='Error loading models: '+e;
+    }
+  }
+
+  async function onToggle(e){
+    const modelId=e.target.dataset.model;
+    e.target.disabled=true;
+    try{
+      const r=await fetch('/api/models/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:modelId})});
+      if(!r.ok) throw new Error(r.status);
+      const data=await r.json();
+      // Update local state
+      const m=models.find(x=>x.id===modelId);
+      if(m){ m.enabled=data.enabled; }
+      checkWarning(models);
+      const card=e.target.closest('.model-card');
+      if(card){ card.classList.toggle('disabled',!data.enabled); }
+      e.target.checked=data.enabled;
+    }catch(err){
+      // revert
+      e.target.checked=!e.target.checked;
+      alert('Toggle failed: '+err);
+    }finally{
+      e.target.disabled=false;
+    }
+  }
+
+  load();
+  refreshTimer=setInterval(load,5000);
+  window.addEventListener('beforeunload',()=>clearInterval(refreshTimer));
+})();
+</script>
+</body>
+</html>`;
+}
+
 export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const listenPort = options.port ?? getProxyPort();
   const configuredProviders = getConfiguredProviders(options.apiKeys);
@@ -644,6 +888,44 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         }));
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ object: "list", data: models }));
+      return;
+    }
+
+    // Dashboard UI
+    if (req.url === "/dashboard" || req.url === "/dashboard/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(getDashboardHtml());
+      return;
+    }
+
+    // GET /api/models
+    if (req.url === "/api/models" && req.method === "GET") {
+      const models = getAllModelsWithState(routerOpts.config);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
+      res.end(JSON.stringify(models));
+      return;
+    }
+
+    // POST /api/models/toggle
+    if (req.url === "/api/models/toggle" && req.method === "POST") {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string };
+          if (!body.model || typeof body.model !== "string") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Missing model field" }));
+            return;
+          }
+          const enabled = toggleModel(body.model);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ model: body.model, enabled }));
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+        }
+      });
       return;
     }
 
@@ -889,6 +1171,12 @@ async function proxyRequest(
       modelsToTry = contextFiltered.slice(0, MAX_FALLBACK_ATTEMPTS);
       // Filter to models with accessible keys (direct or OpenRouter)
       modelsToTry = modelsToTry.filter((m) => isModelAccessible(options.apiKeys, m));
+      modelsToTry = modelsToTry.filter((m) => !isDisabled(m));
+      if (modelsToTry.length === 0) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `All models for tier ${routingDecision.tier} are disabled. Enable at least one model in the dashboard.`, type: "all_models_disabled" } }));
+        return;
+      }
       modelsToTry = prioritizeNonRateLimited(modelsToTry);
     } else {
       modelsToTry = modelId ? [modelId] : [];
