@@ -446,6 +446,50 @@ export const BLOCKRUN_MODELS: BlockRunModel[] = [
     contextWindow: 262144,
     maxOutput: 16384,
   },
+
+  // AWS Bedrock - Claude models via cross-region inference
+  {
+    id: "amazon-bedrock/eu.anthropic.claude-opus-4-6-v1",
+    name: "Bedrock Claude Opus 4.6",
+    inputPrice: 15.0,
+    outputPrice: 75.0,
+    contextWindow: 200000,
+    maxOutput: 32000,
+    reasoning: true,
+    vision: true,
+    agentic: true,
+  },
+  {
+    id: "amazon-bedrock/eu.anthropic.claude-sonnet-4-6",
+    name: "Bedrock Claude Sonnet 4.6",
+    inputPrice: 3.0,
+    outputPrice: 15.0,
+    contextWindow: 200000,
+    maxOutput: 64000,
+    reasoning: true,
+    vision: true,
+    agentic: true,
+  },
+  {
+    id: "amazon-bedrock/eu.anthropic.claude-sonnet-4-20250514-v1:0",
+    name: "Bedrock Claude Sonnet 4",
+    inputPrice: 3.0,
+    outputPrice: 15.0,
+    contextWindow: 200000,
+    maxOutput: 64000,
+    reasoning: true,
+    agentic: true,
+  },
+  {
+    id: "amazon-bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+    name: "Bedrock Claude Haiku 4.5",
+    inputPrice: 1.0,
+    outputPrice: 5.0,
+    contextWindow: 200000,
+    maxOutput: 8192,
+    vision: true,
+    agentic: true,
+  },
 ];
 
 /**

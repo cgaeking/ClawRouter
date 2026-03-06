@@ -10,6 +10,7 @@
 import { startProxy, getProxyPort } from "./proxy.js";
 import { loadApiKeys, getConfiguredProviders, hasOpenRouter, getAccessibleProviders } from "./api-keys.js";
 import { VERSION } from "./version.js";
+import { clog, cerr } from "./log.js";
 
 function printHelp(): void {
   console.log(`
@@ -67,37 +68,36 @@ async function main(): Promise<void> {
   const configured = getConfiguredProviders(apiKeys);
 
   if (configured.length === 0) {
-    console.error("[ClawRouter] No API keys configured!");
-    console.error("[ClawRouter] Quickest: export OPENROUTER_API_KEY=sk-or-...  (one key → all models)");
-    console.error("[ClawRouter] Or set individual keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.");
-    console.error("[ClawRouter] Or edit ~/.openclaw/clawrouter/config.json");
+    cerr("[ClawRouter] No API keys configured!");
+    cerr("[ClawRouter] Quickest: export OPENROUTER_API_KEY=sk-or-...  (one key → all models)");
+    cerr("[ClawRouter] Or set individual keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.");
+    cerr("[ClawRouter] Or edit ~/.openclaw/clawrouter/config.json");
     process.exit(1);
   }
 
   const accessible = getAccessibleProviders(apiKeys);
   const orFallback = hasOpenRouter(apiKeys);
-  console.log(`[ClawRouter] Configured providers: ${configured.join(", ")}${orFallback ? " (OpenRouter covers all)" : ""}`);
-  console.log(`[ClawRouter] Accessible providers: ${accessible.join(", ")} (${accessible.length} total)`);
+  clog(`[ClawRouter] Configured providers: ${configured.join(", ")}${orFallback ? " (OpenRouter covers all)" : ""}`);
+  clog(`[ClawRouter] Accessible providers: ${accessible.join(", ")} (${accessible.length} total)`);
 
   const proxy = await startProxy({
     apiKeys,
     port: args.port,
     onReady: (port) => {
-      console.log(`[ClawRouter] Proxy listening on http://127.0.0.1:${port}`);
-      console.log(`[ClawRouter] Health check: http://127.0.0.1:${port}/health`);
+      clog(`[ClawRouter] Proxy listening on http://127.0.0.1:${port}`);
+      clog(`[ClawRouter] Health check: http://127.0.0.1:${port}/health`);
     },
-    onError: (error) => console.error(`[ClawRouter] Error: ${error.message}`),
+    onError: (error) => cerr(`[ClawRouter] Error: ${error.message}`),
     onRouted: (decision) => {
       const cost = decision.costEstimate.toFixed(4);
-      const saved = (decision.savings * 100).toFixed(0);
-      console.log(`[ClawRouter] [${decision.tier}] ${decision.model} ~$${cost} (saved ${saved}%)`);
+      clog(`[ClawRouter] [${decision.tier}] ${decision.model} ~$${cost}`);
     },
   });
 
-  console.log(`[ClawRouter] Ready - Ctrl+C to stop`);
+  clog(`[ClawRouter] Ready - Ctrl+C to stop`);
 
   const shutdown = async (signal: string) => {
-    console.log(`\n[ClawRouter] Received ${signal}, shutting down...`);
+    clog(`\n[ClawRouter] Received ${signal}, shutting down...`);
     try { await proxy.close(); process.exit(0); } catch { process.exit(1); }
   };
 
@@ -106,4 +106,4 @@ async function main(): Promise<void> {
   await new Promise(() => {});
 }
 
-main().catch((err) => { console.error(`[ClawRouter] Fatal: ${err.message}`); process.exit(1); });
+main().catch((err) => { cerr(`[ClawRouter] Fatal: ${err.message}`); process.exit(1); });

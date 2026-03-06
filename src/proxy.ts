@@ -14,6 +14,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { finished } from "node:stream";
 import type { AddressInfo } from "node:net";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   loadApiKeys,
   getConfiguredProviders,
@@ -43,6 +46,7 @@ import { RequestDeduplicator } from "./dedup.js";
 import { USER_AGENT } from "./version.js";
 import { SessionStore, getSessionId, type SessionConfig } from "./session.js";
 import { resolveOpenRouterModelId, ensureOpenRouterCache } from "./openrouter-models.js";
+import { BedrockRuntimeClient, ConverseStreamCommand, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 
 const AUTO_MODEL = "clawrouter/auto";
 const AUTO_MODEL_SHORT = "auto";
@@ -57,6 +61,104 @@ const PORT_RETRY_DELAY_MS = 1_000;
 
 const rateLimitedModels = new Map<string, number>();
 
+// ---------------------------------------------------------------------------
+// Stop reason mapping — Anthropic/Bedrock → OpenAI format
+// ---------------------------------------------------------------------------
+function mapStopReason(reason: string | undefined | null): string {
+  switch (reason) {
+    case "end_turn": return "stop";
+    case "max_tokens": return "length";
+    case "tool_use": return "tool_calls";
+    case "stop_sequence": return "stop";
+    default: return reason || "stop";
+  }
+}
+
+import { clog, cerr } from "./log.js";
+
+// ---------------------------------------------------------------------------
+// DisabledModels — in-memory toggle state, persisted to disk
+// ---------------------------------------------------------------------------
+const DISABLED_MODELS_DIR = join(homedir(), ".openclaw", "clawrouter");
+const DISABLED_MODELS_FILE = join(DISABLED_MODELS_DIR, "disabled-models.json");
+
+const disabledModels = (() => {
+  const s = new Set<string>();
+  try {
+    mkdirSync(DISABLED_MODELS_DIR, { recursive: true });
+    const raw = readFileSync(DISABLED_MODELS_FILE, "utf8");
+    const list = JSON.parse(raw) as string[];
+    if (Array.isArray(list)) list.forEach((id) => s.add(id));
+  } catch {
+    // File doesn't exist yet — start with empty set
+  }
+  return s;
+})();
+
+function saveDisabledModels(): void {
+  try {
+    mkdirSync(DISABLED_MODELS_DIR, { recursive: true });
+    writeFileSync(DISABLED_MODELS_FILE, JSON.stringify([...disabledModels], null, 2), "utf8");
+  } catch (err) {
+    cerr("[ClawRouter] Failed to save disabled-models.json:", err);
+  }
+}
+
+export function isDisabled(modelId: string): boolean {
+  return disabledModels.has(modelId);
+}
+
+export function toggleModel(modelId: string): boolean {
+  if (disabledModels.has(modelId)) {
+    disabledModels.delete(modelId);
+  } else {
+    disabledModels.add(modelId);
+  }
+  saveDisabledModels();
+  return !disabledModels.has(modelId); // returns new enabled state
+}
+
+export function getDisabledSet(): ReadonlySet<string> {
+  return disabledModels;
+}
+
+type ModelInfo = {
+  id: string;
+  provider: string;
+  enabled: boolean;
+  tiers: Array<{ name: string; role: "primary" | "fallback" }>;
+};
+
+export function getAllModelsWithState(config: typeof DEFAULT_ROUTING_CONFIG): ModelInfo[] {
+  const modelMap = new Map<string, ModelInfo>();
+
+  function addModel(id: string, tierName: string, role: "primary" | "fallback"): void {
+    if (!modelMap.has(id)) {
+      const provider = id.includes("/") ? id.split("/")[0] : "unknown";
+      modelMap.set(id, { id, provider, enabled: !disabledModels.has(id), tiers: [] });
+    }
+    modelMap.get(id)!.tiers.push({ name: tierName, role });
+  }
+
+  const tierNames = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"] as const;
+  for (const t of tierNames) {
+    const tier = config.tiers[t];
+    addModel(tier.primary, t, "primary");
+    tier.fallback.forEach((m) => addModel(m, t, "fallback"));
+  }
+  if (config.agenticTiers) {
+    for (const t of tierNames) {
+      const tier = config.agenticTiers[t];
+      if (!tier) continue;
+      addModel(tier.primary, `agentic-${t}`, "primary");
+      tier.fallback.forEach((m) => addModel(m, `agentic-${t}`, "fallback"));
+    }
+  }
+
+  return [...modelMap.values()].sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+}
+// ---------------------------------------------------------------------------
+
 function isRateLimited(modelId: string): boolean {
   const hitTime = rateLimitedModels.get(modelId);
   if (!hitTime) return false;
@@ -69,7 +171,7 @@ function isRateLimited(modelId: string): boolean {
 
 function markRateLimited(modelId: string): void {
   rateLimitedModels.set(modelId, Date.now());
-  console.log(`[ClawRouter] Model ${modelId} rate-limited, will deprioritize for 60s`);
+  clog(`[ClawRouter] Model ${modelId} rate-limited, will deprioritize for 60s`);
 }
 
 function prioritizeNonRateLimited(models: string[]): string[] {
@@ -317,7 +419,7 @@ function convertAnthropicResponseToOpenAI(anthropicData: Record<string, unknown>
         role: "assistant",
         content: textContent,
       },
-      finish_reason: anthropicData.stop_reason === "end_turn" ? "stop" : (anthropicData.stop_reason || "stop"),
+      finish_reason: mapStopReason(anthropicData.stop_reason as string),
     }],
     usage: anthropicData.usage ? {
       prompt_tokens: (anthropicData.usage as Record<string, number>).input_tokens || 0,
@@ -484,6 +586,190 @@ type ModelRequestResult = {
   isProviderError?: boolean;
 };
 
+// AWS Bedrock — lazy-initialized SDK client
+let bedrockClient: BedrockRuntimeClient | null = null;
+
+function getBedrockClient(): BedrockRuntimeClient {
+  if (!bedrockClient) {
+    bedrockClient = new BedrockRuntimeClient({
+      region: process.env.AWS_REGION || "eu-west-1",
+    });
+  }
+  return bedrockClient;
+}
+
+type BedrockMessage = { role: "user" | "assistant"; content: Array<{ text: string }> };
+
+async function tryBedrockRequest(
+  modelId: string,
+  body: Buffer,
+  isStreaming: boolean,
+  signal: AbortSignal,
+): Promise<ModelRequestResult> {
+  // Strip "amazon-bedrock/" prefix to get the Bedrock model ID
+  const bedrockModelId = modelId.replace("amazon-bedrock/", "");
+
+  try {
+    const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
+    const messages = (parsed.messages as Array<{ role: string; content: string | unknown }>) || [];
+
+    // Convert OpenAI format to Bedrock Converse format
+    const systemMessages: Array<{ text: string }> = [];
+    const converseMessages: BedrockMessage[] = [];
+
+    for (const msg of messages) {
+      const textContent = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      if (msg.role === "system") {
+        systemMessages.push({ text: textContent });
+      } else {
+        converseMessages.push({
+          role: msg.role === "assistant" ? "assistant" : "user",
+          content: [{ text: textContent }],
+        });
+      }
+    }
+
+    // Ensure first non-system message is from user (Bedrock requirement)
+    if (converseMessages.length > 0 && converseMessages[0].role === "assistant") {
+      converseMessages.unshift({ role: "user", content: [{ text: "(continuing conversation)" }] });
+    }
+
+    // Ensure messages alternate user/assistant — merge consecutive same-role messages
+    const alternating: BedrockMessage[] = [];
+    for (const msg of converseMessages) {
+      if (alternating.length > 0 && alternating[alternating.length - 1].role === msg.role) {
+        // Merge into previous message
+        alternating[alternating.length - 1].content.push(...msg.content);
+      } else {
+        alternating.push({ ...msg, content: [...msg.content] });
+      }
+    }
+
+    const maxTokens = (parsed.max_tokens as number) || 4096;
+    const temperature = parsed.temperature as number | undefined;
+
+    const inferenceConfig: Record<string, unknown> = { maxTokens };
+    if (temperature !== undefined) inferenceConfig.temperature = temperature;
+
+    const client = getBedrockClient();
+
+    if (isStreaming) {
+      const command = new ConverseStreamCommand({
+        modelId: bedrockModelId,
+        messages: alternating as any,
+        system: systemMessages.length > 0 ? systemMessages as any : undefined,
+        inferenceConfig: inferenceConfig as any,
+      });
+
+      clog(`[ClawRouter] → bedrock ${bedrockModelId} (streaming)`);
+      const response = await client.send(command, { abortSignal: signal });
+
+      const stream = response.stream;
+      if (!stream) {
+        return { success: false, errorBody: "No stream in Bedrock response", errorStatus: 500, isProviderError: true };
+      }
+
+      const chatId = `chatcmpl-bedrock-${Date.now()}`;
+      const created = Math.floor(Date.now() / 1000);
+
+      const sseChunks: string[] = [];
+
+      // Role chunk
+      sseChunks.push(`data: ${JSON.stringify({
+        id: chatId, object: "chat.completion.chunk", created, model: modelId,
+        choices: [{ index: 0, delta: { role: "assistant" }, logprobs: null, finish_reason: null }],
+      })}\n\n`);
+
+      for await (const event of stream) {
+        if (signal.aborted) break;
+
+        if (event.contentBlockDelta) {
+          const delta = event.contentBlockDelta.delta;
+          if (delta && "text" in delta && delta.text) {
+            sseChunks.push(`data: ${JSON.stringify({
+              id: chatId, object: "chat.completion.chunk", created, model: modelId,
+              choices: [{ index: 0, delta: { content: delta.text }, logprobs: null, finish_reason: null }],
+            })}\n\n`);
+          }
+        }
+
+        if (event.messageStop) {
+          const reason = mapStopReason(event.messageStop.stopReason);
+          sseChunks.push(`data: ${JSON.stringify({
+            id: chatId, object: "chat.completion.chunk", created, model: modelId,
+            choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: reason }],
+          })}\n\n`);
+        }
+      }
+
+      sseChunks.push("data: [DONE]\n\n");
+
+      const sseBody = sseChunks.join("");
+      const responseObj = new Response(sseBody, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+
+      return { success: true, response: responseObj };
+
+    } else {
+      // Non-streaming
+      const command = new ConverseCommand({
+        modelId: bedrockModelId,
+        messages: alternating as any,
+        system: systemMessages.length > 0 ? systemMessages as any : undefined,
+        inferenceConfig: inferenceConfig as any,
+      });
+
+      clog(`[ClawRouter] → bedrock ${bedrockModelId} (non-streaming)`);
+      const response = await client.send(command, { abortSignal: signal });
+
+      const textContent = response.output?.message?.content
+        ?.filter((b: any) => "text" in b)
+        .map((b: any) => b.text)
+        .join("") || "";
+
+      const openaiResponse = {
+        id: `chatcmpl-bedrock-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: modelId,
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: textContent },
+          finish_reason: mapStopReason(response.stopReason),
+        }],
+        usage: response.usage ? {
+          prompt_tokens: response.usage.inputTokens || 0,
+          completion_tokens: response.usage.outputTokens || 0,
+          total_tokens: (response.usage.inputTokens || 0) + (response.usage.outputTokens || 0),
+        } : undefined,
+      };
+
+      const responseObj = new Response(JSON.stringify(openaiResponse), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+
+      return { success: true, response: responseObj };
+    }
+
+  } catch (err: unknown) {
+    const error = err as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
+    const status = error.$metadata?.httpStatusCode || 500;
+    const isThrottling = error.name === "ThrottlingException" || status === 429;
+
+    clog(`[ClawRouter] ← bedrock error: ${error.name || "Unknown"} ${error.message?.slice(0, 200)}`);
+
+    return {
+      success: false,
+      errorBody: error.message || String(err),
+      errorStatus: isThrottling ? 429 : status,
+      isProviderError: true,
+    };
+  }
+}
+
 async function tryModelRequest(
   modelId: string,
   path: string,
@@ -493,6 +779,17 @@ async function tryModelRequest(
   apiKeys: ApiKeysConfig,
   signal: AbortSignal,
 ): Promise<ModelRequestResult> {
+  // AWS Bedrock — use SDK instead of HTTP fetch
+  const modelProvider = getProviderFromModel(modelId);
+  if (modelProvider === "amazon-bedrock") {
+    let isStreaming = false;
+    try {
+      const parsed = JSON.parse(body.toString());
+      isStreaming = parsed.stream === true;
+    } catch {}
+    return tryBedrockRequest(modelId, body, isStreaming, signal);
+  }
+
   const upstream = buildUpstreamUrl(modelId, path, apiKeys);
   if (!upstream) {
     return {
@@ -536,7 +833,7 @@ async function tryModelRequest(
   const headers = buildProviderHeaders(upstream.provider, upstream.apiKey, upstream.viaOpenRouter);
 
   try {
-    console.log(`[ClawRouter] → ${upstream.provider} ${upstream.url} model=${upstream.actualModelId} viaOR=${upstream.viaOpenRouter}`);
+    clog(`[ClawRouter] → ${upstream.provider} ${upstream.url} model=${upstream.actualModelId} viaOR=${upstream.viaOpenRouter}`);
     const response = await fetch(upstream.url, {
       method,
       headers,
@@ -546,7 +843,7 @@ async function tryModelRequest(
 
     if (response.status !== 200) {
       const errorBody = await response.text();
-      console.log(`[ClawRouter] ← ${response.status} ${errorBody.slice(0, 200)}`);
+      clog(`[ClawRouter] ← ${response.status} ${errorBody.slice(0, 200)}`);
       return {
         success: false,
         errorBody,
@@ -564,6 +861,164 @@ async function tryModelRequest(
       isProviderError: true,
     };
   }
+}
+
+function getDashboardHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ClawRouter — Model Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;font-size:14px;min-height:100vh}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:16px 24px;display:flex;align-items:center;gap:12px}
+header h1{font-size:18px;font-weight:600;color:#e6edf3}
+header .subtitle{color:#8b949e;font-size:13px}
+.badge-live{background:#1a3a1a;color:#3fb950;border:1px solid #238636;border-radius:12px;padding:2px 8px;font-size:11px;margin-left:auto}
+main{max-width:960px;margin:0 auto;padding:24px}
+.warning{background:#2d1c02;border:1px solid #bb8009;border-radius:6px;padding:12px 16px;margin-bottom:20px;color:#d29922;font-size:13px;display:none}
+.warning.show{display:block}
+.provider-group{margin-bottom:28px}
+.provider-title{font-size:12px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #21262d}
+.model-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px;transition:border-color .15s}
+.model-card:hover{border-color:#58a6ff}
+.model-card.disabled{opacity:.55}
+.model-id{flex:1;font-family:monospace;font-size:13px;color:#e6edf3}
+.tiers{display:flex;flex-wrap:wrap;gap:4px;margin-right:8px}
+.tier-badge{border-radius:4px;padding:2px 7px;font-size:11px;font-weight:500;white-space:nowrap}
+.tier-badge.primary{background:#0d2a4a;color:#58a6ff;border:1px solid #1f6feb}
+.tier-badge.fallback{background:#1c1c1c;color:#8b949e;border:1px solid #30363d}
+.toggle{position:relative;width:40px;height:22px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0;position:absolute}
+.slider{position:absolute;inset:0;background:#30363d;border-radius:22px;cursor:pointer;transition:.2s}
+.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;background:#8b949e;border-radius:50%;transition:.2s}
+input:checked+.slider{background:#238636}
+input:checked+.slider:before{transform:translateX(18px);background:#fff}
+.toggle:hover .slider{border:1px solid #8b949e}
+.status-bar{text-align:center;color:#484f58;font-size:12px;padding:8px 0 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>ClawRouter</h1>
+  <span class="subtitle">Model Dashboard</span>
+  <span class="badge-live" id="liveTag">live</span>
+</header>
+<main>
+  <div class="warning" id="warning"></div>
+  <div id="groups"></div>
+  <div class="status-bar" id="statusBar">Loading…</div>
+</main>
+<script>
+(function(){
+  let models=[], refreshTimer;
+
+  function tierLabel(name){ return name.replace('agentic-','A-'); }
+
+  function buildTierCoverage(models){
+    const tiers={};
+    for(const m of models){
+      for(const t of m.tiers){
+        if(!tiers[t.name]) tiers[t.name]=[];
+        if(m.enabled) tiers[t.name].push(m.id);
+      }
+    }
+    return tiers;
+  }
+
+  function checkWarning(models){
+    const coverage=buildTierCoverage(models);
+    const empty=Object.entries(coverage).filter(([,ids])=>ids.length===0).map(([t])=>t);
+    const w=document.getElementById('warning');
+    if(empty.length){
+      w.textContent='Warning: '+empty.join(', ')+' '+(empty.length>1?'have':'has')+' no enabled models — requests to those tiers will return 503.';
+      w.classList.add('show');
+    } else {
+      w.classList.remove('show');
+    }
+  }
+
+  function render(data){
+    models=data;
+    checkWarning(models);
+    const byProvider={};
+    for(const m of models){
+      if(!byProvider[m.provider]) byProvider[m.provider]=[];
+      byProvider[m.provider].push(m);
+    }
+    const g=document.getElementById('groups');
+    g.innerHTML='';
+    for(const [provider, list] of Object.entries(byProvider).sort()){
+      const div=document.createElement('div');
+      div.className='provider-group';
+      div.innerHTML='<div class="provider-title">'+escHtml(provider)+'</div>';
+      for(const m of list){
+        const card=document.createElement('div');
+        card.className='model-card'+(m.enabled?'':' disabled');
+        card.dataset.id=m.id;
+        const tBadges=m.tiers.map(t=>'<span class="tier-badge '+escHtml(t.role)+'">'+escHtml(tierLabel(t.name))+'</span>').join('');
+        card.innerHTML=
+          '<span class="model-id">'+escHtml(m.id.includes('/')?m.id.split('/').slice(1).join('/'):m.id)+'</span>'+
+          '<div class="tiers">'+tBadges+'</div>'+
+          '<label class="toggle" title="'+(m.enabled?'Disable':'Enable')+' '+escHtml(m.id)+'">'+
+            '<input type="checkbox"'+(m.enabled?' checked':'')+' data-model="'+escHtml(m.id)+'">'+
+            '<span class="slider"></span>'+
+          '</label>';
+        div.appendChild(card);
+      }
+      g.appendChild(div);
+    }
+    g.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+      cb.addEventListener('change',onToggle);
+    });
+    const ts=new Date().toLocaleTimeString();
+    document.getElementById('statusBar').textContent='Last updated: '+ts+' · '+models.length+' models';
+  }
+
+  function escHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]||c)); }
+
+  async function load(){
+    try{
+      const r=await fetch('/api/models');
+      if(!r.ok) throw new Error(r.status);
+      render(await r.json());
+    }catch(e){
+      document.getElementById('statusBar').textContent='Error loading models: '+e;
+    }
+  }
+
+  async function onToggle(e){
+    const modelId=e.target.dataset.model;
+    e.target.disabled=true;
+    try{
+      const r=await fetch('/api/models/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:modelId})});
+      if(!r.ok) throw new Error(r.status);
+      const data=await r.json();
+      // Update local state
+      const m=models.find(x=>x.id===modelId);
+      if(m){ m.enabled=data.enabled; }
+      checkWarning(models);
+      const card=e.target.closest('.model-card');
+      if(card){ card.classList.toggle('disabled',!data.enabled); }
+      e.target.checked=data.enabled;
+    }catch(err){
+      // revert
+      e.target.checked=!e.target.checked;
+      alert('Toggle failed: '+err);
+    }finally{
+      e.target.disabled=false;
+    }
+  }
+
+  load();
+  refreshTimer=setInterval(load,5000);
+  window.addEventListener('beforeunload',()=>clearInterval(refreshTimer));
+})();
+</script>
+</body>
+</html>`;
 }
 
 export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
@@ -590,9 +1045,9 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const connections = new Set<import("net").Socket>();
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    req.on("error", (err) => console.error(`[ClawRouter] Request stream error: ${err.message}`));
-    res.on("error", (err) => console.error(`[ClawRouter] Response stream error: ${err.message}`));
-    finished(res, (err) => { if (err && err.code !== "ERR_STREAM_DESTROYED") console.error(`[ClawRouter] Response finished with error: ${err.message}`); });
+    req.on("error", (err) => cerr(`[ClawRouter] Request stream error: ${err.message}`));
+    res.on("error", (err) => cerr(`[ClawRouter] Response stream error: ${err.message}`));
+    finished(res, (err) => { if (err && err.code !== "ERR_STREAM_DESTROYED") cerr(`[ClawRouter] Response finished with error: ${err.message}`); });
 
     // Health check
     if (req.url === "/health" || req.url?.startsWith("/health?")) {
@@ -644,6 +1099,44 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         }));
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ object: "list", data: models }));
+      return;
+    }
+
+    // Dashboard UI
+    if (req.url === "/dashboard" || req.url === "/dashboard/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(getDashboardHtml());
+      return;
+    }
+
+    // GET /api/models
+    if (req.url === "/api/models" && req.method === "GET") {
+      const models = getAllModelsWithState(routerOpts.config);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
+      res.end(JSON.stringify(models));
+      return;
+    }
+
+    // POST /api/models/toggle
+    if (req.url === "/api/models/toggle" && req.method === "POST") {
+      try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string };
+        if (!body.model || typeof body.model !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing model field" }));
+          return;
+        }
+        const enabled = toggleModel(body.model);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ model: body.model, enabled }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
       return;
     }
 
@@ -708,13 +1201,13 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const port = addr.port;
   options.onReady?.(port);
 
-  server.on("error", (err) => { console.error(`[ClawRouter] Server runtime error: ${err.message}`); options.onError?.(err); });
-  server.on("clientError", (err, socket) => { console.error(`[ClawRouter] Client error: ${err.message}`); if (socket.writable && !socket.destroyed) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); });
+  server.on("error", (err) => { cerr(`[ClawRouter] Server runtime error: ${err.message}`); options.onError?.(err); });
+  server.on("clientError", (err, socket) => { cerr(`[ClawRouter] Client error: ${err.message}`); if (socket.writable && !socket.destroyed) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"); });
   server.on("connection", (socket) => {
     connections.add(socket);
     socket.setTimeout(300_000);
     socket.on("timeout", () => socket.destroy());
-    socket.on("error", (err) => console.error(`[ClawRouter] Socket error: ${err.message}`));
+    socket.on("error", (err) => cerr(`[ClawRouter] Socket error: ${err.message}`));
     socket.on("close", () => connections.delete(socket));
   });
 
@@ -772,7 +1265,7 @@ async function proxyRequest(
         normalizedModel === "blockrun/auto" || // backward compat
         normalizedModel === "clawrouter/auto";
 
-      console.log(`[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}, isAuto: ${isAutoModel}`);
+      clog(`[ClawRouter] Received model: "${parsed.model}" -> normalized: "${normalizedModel}"${wasAlias ? ` -> alias: "${resolvedModel}"` : ""}, isAuto: ${isAutoModel}`);
 
       if (wasAlias && !isAutoModel) {
         parsed.model = resolvedModel;
@@ -784,7 +1277,7 @@ async function proxyRequest(
         const existingSession = sessionId ? sessionStore.getSession(sessionId) : undefined;
 
         if (existingSession) {
-          console.log(`[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`);
+          clog(`[ClawRouter] Session ${sessionId?.slice(0, 8)}... using pinned model: ${existingSession.model}`);
           parsed.model = existingSession.model;
           modelId = existingSession.model;
           sessionStore.touchSession(sessionId!);
@@ -840,7 +1333,7 @@ async function proxyRequest(
       body = Buffer.from(JSON.stringify(parsed));
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[ClawRouter] Routing error: ${errorMsg}`);
+      cerr(`[ClawRouter] Routing error: ${errorMsg}`);
       options.onError?.(new Error(`Routing failed: ${errorMsg}`));
     }
   }
@@ -889,6 +1382,12 @@ async function proxyRequest(
       modelsToTry = contextFiltered.slice(0, MAX_FALLBACK_ATTEMPTS);
       // Filter to models with accessible keys (direct or OpenRouter)
       modelsToTry = modelsToTry.filter((m) => isModelAccessible(options.apiKeys, m));
+      modelsToTry = modelsToTry.filter((m) => !isDisabled(m));
+      if (modelsToTry.length === 0) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: `All models for tier ${routingDecision.tier} are disabled. Enable at least one model in the dashboard.`, type: "all_models_disabled" } }));
+        return;
+      }
       modelsToTry = prioritizeNonRateLimited(modelsToTry);
     } else {
       modelsToTry = modelId ? [modelId] : [];
@@ -901,21 +1400,21 @@ async function proxyRequest(
     for (let i = 0; i < modelsToTry.length; i++) {
       const tryModel = modelsToTry[i];
       const isLastAttempt = i === modelsToTry.length - 1;
-      console.log(`[ClawRouter] Trying model ${i + 1}/${modelsToTry.length}: ${tryModel}`);
+      clog(`[ClawRouter] Trying model ${i + 1}/${modelsToTry.length}: ${tryModel}`);
 
       const result = await tryModelRequest(tryModel, requestPath, req.method ?? "POST", body, maxTokens, options.apiKeys, controller.signal);
 
       if (result.success && result.response) {
         upstream = result.response;
         actualModelUsed = tryModel;
-        console.log(`[ClawRouter] Success with model: ${tryModel}`);
+        clog(`[ClawRouter] Success with model: ${tryModel}`);
         break;
       }
 
       lastError = { body: result.errorBody || "Unknown error", status: result.errorStatus || 500 };
       if (result.isProviderError && !isLastAttempt) {
         if (result.errorStatus === 429) markRateLimited(tryModel);
-        console.log(`[ClawRouter] Provider error from ${tryModel}, trying fallback: ${result.errorBody?.slice(0, 100)}`);
+        clog(`[ClawRouter] Provider error from ${tryModel}, trying fallback: ${result.errorBody?.slice(0, 100)}`);
         continue;
       }
       break;

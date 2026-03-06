@@ -27,6 +27,7 @@ export const PROVIDER_ENDPOINTS: Record<string, string> = {
   moonshot: "https://api.moonshot.cn/v1",
   nvidia: "https://integrate.api.nvidia.com/v1",
   openrouter: "https://openrouter.ai/api/v1",
+  "amazon-bedrock": "https://bedrock-runtime.eu-west-1.amazonaws.com",
 };
 
 /**
@@ -47,6 +48,7 @@ const ENV_VAR_MAP: Record<string, string> = {
   moonshot: "MOONSHOT_API_KEY",
   nvidia: "NVIDIA_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
+  "amazon-bedrock": "AWS_ACCESS_KEY_ID",
 };
 
 export type ProviderConfig = {
@@ -101,6 +103,15 @@ export function loadApiKeys(pluginConfig?: Record<string, unknown>): ApiKeysConf
     }
   }
 
+  // 4. AWS Bedrock — uses IAM credentials, not a single API key
+  if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+    if (!config.providers["amazon-bedrock"]) {
+      config.providers["amazon-bedrock"] = { apiKey: "iam-sigv4" };
+    } else if (!config.providers["amazon-bedrock"].apiKey) {
+      config.providers["amazon-bedrock"].apiKey = "iam-sigv4";
+    }
+  }
+
   return config;
 }
 
@@ -150,6 +161,15 @@ export function resolveProviderAccess(
   modelId: string,
 ): { apiKey: string; baseUrl: string; provider: string; viaOpenRouter: boolean } | undefined {
   const provider = getProviderFromModel(modelId);
+
+  // AWS Bedrock — uses SDK with IAM credentials, not HTTP+API key
+  if (provider === "amazon-bedrock") {
+    const bedrockConfig = config.providers["amazon-bedrock"];
+    if (bedrockConfig?.apiKey) {
+      return { apiKey: "iam-sigv4", baseUrl: "bedrock-sdk", provider: "amazon-bedrock", viaOpenRouter: false };
+    }
+    // Fall through to OpenRouter if no IAM credentials
+  }
 
   // Anthropic + Google need format conversion (tools, streaming, etc.)
   // Always route through OpenRouter if available — it handles conversion automatically

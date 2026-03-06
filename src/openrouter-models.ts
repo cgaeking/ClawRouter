@@ -12,6 +12,7 @@
  */
 
 import { BLOCKRUN_MODELS } from "./models.js";
+import { clog, cerr } from "./log.js";
 
 type OpenRouterModel = { id: string; name?: string };
 
@@ -90,7 +91,7 @@ export async function refreshOpenRouterModels(apiKey: string): Promise<void> {
   );
   if (mapped.length > 0) {
     for (const [from, to] of mapped) {
-      console.log(`[ClawRouter]   ${from} → ${to}`);
+      clog(`[ClawRouter]   ${from} → ${to}`);
     }
   }
 }
@@ -118,6 +119,6 @@ export function isOpenRouterCacheReady(): boolean {
 export function ensureOpenRouterCache(apiKey: string): void {
   if (isOpenRouterCacheReady()) return;
   refreshOpenRouterModels(apiKey).catch((err) => {
-    console.error(`[ClawRouter] Background OpenRouter cache refresh failed: ${err.message}`);
+    cerr(`[ClawRouter] Background OpenRouter cache refresh failed: ${err.message}`);
   });
 }
