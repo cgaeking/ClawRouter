@@ -635,44 +635,40 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
 
   tiers: {
     SIMPLE: {
-      primary: "google/gemini-2.5-flash",
-      fallback: ["nvidia/gpt-oss-120b", "deepseek/deepseek-chat", "openai/gpt-4o-mini"],
+      primary: "amazon-bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-sonnet-4-6", "google/gemini-2.5-flash"],
     },
     MEDIUM: {
-      primary: "xai/grok-code-fast-1", // Code specialist, $0.20/$1.50
-      fallback: [
-        "deepseek/deepseek-chat",
-        "xai/grok-4-fast-non-reasoning",
-        "google/gemini-2.5-flash",
-      ],
+      primary: "amazon-bedrock/eu.anthropic.claude-sonnet-4-6",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
     },
     COMPLEX: {
-      primary: "google/gemini-2.5-pro",
-      fallback: ["anthropic/claude-sonnet-4", "xai/grok-4-0709", "openai/gpt-4o"],
+      primary: "amazon-bedrock/eu.anthropic.claude-sonnet-4-6",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
     },
     REASONING: {
-      primary: "xai/grok-4-fast-reasoning", // Ultra-cheap reasoning $0.20/$0.50
-      fallback: ["deepseek/deepseek-reasoner", "moonshot/kimi-k2.5", "google/gemini-2.5-pro"],
+      primary: "amazon-bedrock/eu.anthropic.claude-opus-4-6-v1",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-sonnet-4-6", "openai/o3-mini"],
     },
   },
 
   // Agentic tier configs - models that excel at multi-step autonomous tasks
   agenticTiers: {
     SIMPLE: {
-      primary: "anthropic/claude-haiku-4.5",
-      fallback: ["moonshot/kimi-k2.5", "xai/grok-4-fast-non-reasoning", "openai/gpt-4o-mini"],
+      primary: "amazon-bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-sonnet-4-6", "openai/gpt-4o-mini"],
     },
     MEDIUM: {
-      primary: "xai/grok-code-fast-1", // Code specialist for agentic coding
-      fallback: ["moonshot/kimi-k2.5", "anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-4"],
+      primary: "amazon-bedrock/eu.anthropic.claude-sonnet-4-6",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
     },
     COMPLEX: {
-      primary: "google/gemini-2.5-pro", // 1M context, strong tool use, ~60% cheaper than Sonnet
-      fallback: ["anthropic/claude-sonnet-4", "xai/grok-4-0709", "openai/gpt-4o"],
+      primary: "amazon-bedrock/eu.anthropic.claude-sonnet-4-6",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-opus-4-6-v1", "openai/gpt-4o"],
     },
     REASONING: {
-      primary: "anthropic/claude-sonnet-4", // Strong tool use + reasoning for agentic tasks
-      fallback: ["xai/grok-4-fast-reasoning", "moonshot/kimi-k2.5", "deepseek/deepseek-reasoner"],
+      primary: "amazon-bedrock/eu.anthropic.claude-opus-4-6-v1",
+      fallback: ["amazon-bedrock/eu.anthropic.claude-sonnet-4-6", "openai/o3-mini"],
     },
   },
 

@@ -46,6 +46,7 @@ import { RequestDeduplicator } from "./dedup.js";
 import { USER_AGENT } from "./version.js";
 import { SessionStore, getSessionId, type SessionConfig } from "./session.js";
 import { resolveOpenRouterModelId, ensureOpenRouterCache } from "./openrouter-models.js";
+import { BedrockRuntimeClient, ConverseStreamCommand, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 
 const AUTO_MODEL = "clawrouter/auto";
 const AUTO_MODEL_SHORT = "auto";
@@ -570,6 +571,190 @@ type ModelRequestResult = {
   isProviderError?: boolean;
 };
 
+// AWS Bedrock — lazy-initialized SDK client
+let bedrockClient: BedrockRuntimeClient | null = null;
+
+function getBedrockClient(): BedrockRuntimeClient {
+  if (!bedrockClient) {
+    bedrockClient = new BedrockRuntimeClient({
+      region: process.env.AWS_REGION || "eu-west-1",
+    });
+  }
+  return bedrockClient;
+}
+
+type BedrockMessage = { role: "user" | "assistant"; content: Array<{ text: string }> };
+
+async function tryBedrockRequest(
+  modelId: string,
+  body: Buffer,
+  isStreaming: boolean,
+  signal: AbortSignal,
+): Promise<ModelRequestResult> {
+  // Strip "amazon-bedrock/" prefix to get the Bedrock model ID
+  const bedrockModelId = modelId.replace("amazon-bedrock/", "");
+
+  try {
+    const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
+    const messages = (parsed.messages as Array<{ role: string; content: string | unknown }>) || [];
+
+    // Convert OpenAI format to Bedrock Converse format
+    const systemMessages: Array<{ text: string }> = [];
+    const converseMessages: BedrockMessage[] = [];
+
+    for (const msg of messages) {
+      const textContent = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+      if (msg.role === "system") {
+        systemMessages.push({ text: textContent });
+      } else {
+        converseMessages.push({
+          role: msg.role === "assistant" ? "assistant" : "user",
+          content: [{ text: textContent }],
+        });
+      }
+    }
+
+    // Ensure first non-system message is from user (Bedrock requirement)
+    if (converseMessages.length > 0 && converseMessages[0].role === "assistant") {
+      converseMessages.unshift({ role: "user", content: [{ text: "(continuing conversation)" }] });
+    }
+
+    // Ensure messages alternate user/assistant — merge consecutive same-role messages
+    const alternating: BedrockMessage[] = [];
+    for (const msg of converseMessages) {
+      if (alternating.length > 0 && alternating[alternating.length - 1].role === msg.role) {
+        // Merge into previous message
+        alternating[alternating.length - 1].content.push(...msg.content);
+      } else {
+        alternating.push({ ...msg, content: [...msg.content] });
+      }
+    }
+
+    const maxTokens = (parsed.max_tokens as number) || 4096;
+    const temperature = parsed.temperature as number | undefined;
+
+    const inferenceConfig: Record<string, unknown> = { maxTokens };
+    if (temperature !== undefined) inferenceConfig.temperature = temperature;
+
+    const client = getBedrockClient();
+
+    if (isStreaming) {
+      const command = new ConverseStreamCommand({
+        modelId: bedrockModelId,
+        messages: alternating as any,
+        system: systemMessages.length > 0 ? systemMessages as any : undefined,
+        inferenceConfig: inferenceConfig as any,
+      });
+
+      console.log(`[ClawRouter] → bedrock ${bedrockModelId} (streaming)`);
+      const response = await client.send(command, { abortSignal: signal });
+
+      const stream = response.stream;
+      if (!stream) {
+        return { success: false, errorBody: "No stream in Bedrock response", errorStatus: 500, isProviderError: true };
+      }
+
+      const chatId = `chatcmpl-bedrock-${Date.now()}`;
+      const created = Math.floor(Date.now() / 1000);
+
+      const sseChunks: string[] = [];
+
+      // Role chunk
+      sseChunks.push(`data: ${JSON.stringify({
+        id: chatId, object: "chat.completion.chunk", created, model: modelId,
+        choices: [{ index: 0, delta: { role: "assistant" }, logprobs: null, finish_reason: null }],
+      })}\n\n`);
+
+      for await (const event of stream) {
+        if (signal.aborted) break;
+
+        if (event.contentBlockDelta) {
+          const delta = event.contentBlockDelta.delta;
+          if (delta && "text" in delta && delta.text) {
+            sseChunks.push(`data: ${JSON.stringify({
+              id: chatId, object: "chat.completion.chunk", created, model: modelId,
+              choices: [{ index: 0, delta: { content: delta.text }, logprobs: null, finish_reason: null }],
+            })}\n\n`);
+          }
+        }
+
+        if (event.messageStop) {
+          const reason = event.messageStop.stopReason === "end_turn" ? "stop" : (event.messageStop.stopReason || "stop");
+          sseChunks.push(`data: ${JSON.stringify({
+            id: chatId, object: "chat.completion.chunk", created, model: modelId,
+            choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: reason }],
+          })}\n\n`);
+        }
+      }
+
+      sseChunks.push("data: [DONE]\n\n");
+
+      const sseBody = sseChunks.join("");
+      const responseObj = new Response(sseBody, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+
+      return { success: true, response: responseObj };
+
+    } else {
+      // Non-streaming
+      const command = new ConverseCommand({
+        modelId: bedrockModelId,
+        messages: alternating as any,
+        system: systemMessages.length > 0 ? systemMessages as any : undefined,
+        inferenceConfig: inferenceConfig as any,
+      });
+
+      console.log(`[ClawRouter] → bedrock ${bedrockModelId} (non-streaming)`);
+      const response = await client.send(command, { abortSignal: signal });
+
+      const textContent = response.output?.message?.content
+        ?.filter((b: any) => "text" in b)
+        .map((b: any) => b.text)
+        .join("") || "";
+
+      const openaiResponse = {
+        id: `chatcmpl-bedrock-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: modelId,
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: textContent },
+          finish_reason: response.stopReason === "end_turn" ? "stop" : (response.stopReason || "stop"),
+        }],
+        usage: response.usage ? {
+          prompt_tokens: response.usage.inputTokens || 0,
+          completion_tokens: response.usage.outputTokens || 0,
+          total_tokens: (response.usage.inputTokens || 0) + (response.usage.outputTokens || 0),
+        } : undefined,
+      };
+
+      const responseObj = new Response(JSON.stringify(openaiResponse), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+
+      return { success: true, response: responseObj };
+    }
+
+  } catch (err: unknown) {
+    const error = err as Error & { name?: string; $metadata?: { httpStatusCode?: number } };
+    const status = error.$metadata?.httpStatusCode || 500;
+    const isThrottling = error.name === "ThrottlingException" || status === 429;
+
+    console.log(`[ClawRouter] ← bedrock error: ${error.name || "Unknown"} ${error.message?.slice(0, 200)}`);
+
+    return {
+      success: false,
+      errorBody: error.message || String(err),
+      errorStatus: isThrottling ? 429 : status,
+      isProviderError: true,
+    };
+  }
+}
+
 async function tryModelRequest(
   modelId: string,
   path: string,
@@ -579,6 +764,17 @@ async function tryModelRequest(
   apiKeys: ApiKeysConfig,
   signal: AbortSignal,
 ): Promise<ModelRequestResult> {
+  // AWS Bedrock — use SDK instead of HTTP fetch
+  const modelProvider = getProviderFromModel(modelId);
+  if (modelProvider === "amazon-bedrock") {
+    let isStreaming = false;
+    try {
+      const parsed = JSON.parse(body.toString());
+      isStreaming = parsed.stream === true;
+    } catch {}
+    return tryBedrockRequest(modelId, body, isStreaming, signal);
+  }
+
   const upstream = buildUpstreamUrl(modelId, path, apiKeys);
   if (!upstream) {
     return {
@@ -752,7 +948,7 @@ input:checked+.slider:before{transform:translateX(18px);background:#fff}
           '<span class="model-id">'+escHtml(m.id.includes('/')?m.id.split('/').slice(1).join('/'):m.id)+'</span>'+
           '<div class="tiers">'+tBadges+'</div>'+
           '<label class="toggle" title="'+(m.enabled?'Disable':'Enable')+' '+escHtml(m.id)+'">'+
-            '<input type="checkbox"'+(m.enabled?' checked':'')+'data-model="'+escHtml(m.id)+'">'+
+            '<input type="checkbox"'+(m.enabled?' checked':'')+' data-model="'+escHtml(m.id)+'">'+
             '<span class="slider"></span>'+
           '</label>';
         div.appendChild(card);
@@ -908,24 +1104,24 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 
     // POST /api/models/toggle
     if (req.url === "/api/models/toggle" && req.method === "POST") {
-      const chunks: Buffer[] = [];
-      req.on("data", (c: Buffer) => chunks.push(c));
-      req.on("end", () => {
-        try {
-          const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string };
-          if (!body.model || typeof body.model !== "string") {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Missing model field" }));
-            return;
-          }
-          const enabled = toggleModel(body.model);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ model: body.model, enabled }));
-        } catch {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Invalid JSON" }));
+      try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         }
-      });
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string };
+        if (!body.model || typeof body.model !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing model field" }));
+          return;
+        }
+        const enabled = toggleModel(body.model);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ model: body.model, enabled }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
       return;
     }
 
